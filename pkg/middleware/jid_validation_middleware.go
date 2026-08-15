@@ -59,6 +59,44 @@ func (m *JIDValidationMiddleware) ValidateJIDFields(fieldNames ...string) gin.Ha
 		modified := false
 		for _, fieldName := range fieldNames {
 			if value, exists := requestData[fieldName]; exists {
+				// A field may legitimately be an ARRAY of JIDs — `participants`
+				// on POST /group/participant is, and this middleware is
+				// registered for it. Handling only the string case made the
+				// type assertion below fail, leaving strValue at its zero
+				// value ("") so the `else if` rejected every request with
+				// "participants is required and cannot be empty" without ever
+				// looking inside the array — breaking ban/promote/demote
+				// entirely.
+				if arrayValue, ok := value.([]interface{}); ok {
+					for i, item := range arrayValue {
+						strItem, isStr := item.(string)
+						if !isStr || strItem == "" {
+							c.JSON(http.StatusBadRequest, gin.H{
+								"error": fmt.Sprintf("%s[%d] cannot be empty", fieldName, i),
+							})
+							c.Abort()
+							return
+						}
+
+						normalizedJID, err := utils.CreateJID(strItem)
+						if err != nil {
+							c.JSON(http.StatusBadRequest, gin.H{
+								"error": fmt.Sprintf("Invalid %s[%d] format: %s", fieldName, i, err.Error()),
+							})
+							c.Abort()
+							return
+						}
+
+						if normalizedJID != strItem {
+							arrayValue[i] = normalizedJID
+							modified = true
+							logger.LogDebug("Normalized %s[%d] from %s to %s", fieldName, i, strItem, normalizedJID)
+						}
+					}
+					requestData[fieldName] = arrayValue
+					continue
+				}
+
 				if strValue, ok := value.(string); ok && strValue != "" {
 					// Validate and normalize the JID
 					normalizedJID, err := utils.CreateJID(strValue)
