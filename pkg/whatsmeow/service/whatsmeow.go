@@ -301,9 +301,33 @@ func (w whatsmeowService) ForceUpdateJid(instanceId string, number string) error
 	return nil
 }
 
+// instanceStartLocks serializa o início de cliente por instância. Sem isso,
+// duas chamadas concorrentes a StartClient para o MESMO instanceId — típico
+// de /instance/connect (async, via instance_service.Connect) correndo junto
+// com o fallback "client == nil" de GetQr (instance_service.go) — criam dois
+// whatsmeow.Client/device.Store distintos para a mesma instância. Cada um
+// grava/zera (teardownQR) a MESMA linha `instance.qrcode` no banco de forma
+// independente, e o vencedor de `clientPointer[id] = client` é aleatório —
+// o sintoma observável do lado do consumidor é "QR nunca estabiliza", mesmo
+// com eventos QRCode sendo publicados de fato (só que de um client que está
+// sendo descartado pelo outro).
+var instanceStartLocks sync.Map // instanceId (string) -> *sync.Mutex
+
+func lockInstanceStart(instanceId string) *sync.Mutex {
+	l, _ := instanceStartLocks.LoadOrStore(instanceId, &sync.Mutex{})
+	return l.(*sync.Mutex)
+}
+
 func (w whatsmeowService) StartClient(cd *ClientData) {
 
 	w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("Starting websocket connection to Whatsapp for user '%s'", cd.Instance.Id)
+
+	// Serializa o início desta instância — ver comentário de instanceStartLocks.
+	// Held durante toda a inicialização (device store, fetch de versão, Connect),
+	// não só a checagem abaixo: é exatamente essa janela que a race explora.
+	mu := lockInstanceStart(cd.Instance.Id)
+	mu.Lock()
+	defer mu.Unlock()
 
 	var deviceStore *store.Device
 	var err error
@@ -2324,6 +2348,21 @@ func (w whatsmeowService) StartInstance(instanceId string) error {
 	instance, err := w.instanceRepository.GetInstanceByID(instanceId)
 	if err != nil {
 		return err
+	}
+
+	// Client já rodando e conectado para esta instância: não há nada a fazer.
+	// Sem esta checagem, StartInstance sobrescreve killChannel[id] (linha abaixo)
+	// e dispara outro StartClient concorrente incondicionalmente — mesma race
+	// descrita em instanceStartLocks, só que também estragando o canal de kill
+	// do client que já está de pé. A checagem final e autoritativa continua
+	// dentro de StartClient (sob o lock); esta aqui só evita o trabalho e o
+	// clobber de killChannel no caso comum.
+	mu := lockInstanceStart(instance.Id)
+	mu.Lock()
+	alreadyRunning := w.clientPointer[instance.Id] != nil && w.clientPointer[instance.Id].IsConnected()
+	mu.Unlock()
+	if alreadyRunning {
+		return nil
 	}
 
 	if instance.Proxy == "" && w.config.ProxyHost != "" && w.config.ProxyPort != "" && w.config.ProxyUsername != "" && w.config.ProxyPassword != "" {
