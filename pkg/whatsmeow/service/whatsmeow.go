@@ -2643,21 +2643,32 @@ func (w *whatsmeowService) SendToGlobalQueues(eventType string, payload []byte, 
 }
 
 var (
-	cachedWebVersion   *clientVersion
-	cachedWebVersionAt time.Time
-	cachedWebVersionMu sync.Mutex
-	webVersionCacheTTL = 1 * time.Hour
+	cachedWebVersion     *clientVersion
+	cachedWebVersionAt   time.Time
+	cachedWebVersionMu   sync.RWMutex
+	webVersionCacheTTL   = 1 * time.Hour
+	webVersionHTTPClient = &http.Client{Timeout: 10 * time.Second}
 )
 
 func fetchWhatsAppWebVersion() (*clientVersion, error) {
+	cachedWebVersionMu.RLock()
+	if cachedWebVersion != nil && time.Since(cachedWebVersionAt) < webVersionCacheTTL {
+		v := cachedWebVersion
+		cachedWebVersionMu.RUnlock()
+		return v, nil
+	}
+	cachedWebVersionMu.RUnlock()
+
 	cachedWebVersionMu.Lock()
 	defer cachedWebVersionMu.Unlock()
 
+	// Re-check after acquiring the write lock: another goroutine may have
+	// already refreshed the cache while we were waiting.
 	if cachedWebVersion != nil && time.Since(cachedWebVersionAt) < webVersionCacheTTL {
 		return cachedWebVersion, nil
 	}
 
-	resp, err := http.Get("https://web.whatsapp.com/sw.js")
+	resp, err := webVersionHTTPClient.Get("https://web.whatsapp.com/sw.js")
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch WhatsApp Web version: %v", err)
 	}
