@@ -28,6 +28,8 @@ type InstanceRepository interface {
 	UpdateJid(userId string, jid string) error
 	GetAllConnectedInstances() ([]*instance_model.Instance, error)
 	GetAllConnectedInstancesByClientName(clientName string) ([]*instance_model.Instance, error)
+	GetAllReconnectableInstances() ([]*instance_model.Instance, error)
+	GetAllReconnectableInstancesByClientName(clientName string) ([]*instance_model.Instance, error)
 	GetAll(clientName string) ([]*instance_model.Instance, error)
 	Delete(instanceId string) error
 	GetAdvancedSettings(instanceId string) (*instance_model.AdvancedSettings, error)
@@ -129,6 +131,33 @@ func (i *instanceRepository) GetAllConnectedInstances() ([]*instance_model.Insta
 func (i *instanceRepository) GetAllConnectedInstancesByClientName(clientName string) ([]*instance_model.Instance, error) {
 	var instances []*instance_model.Instance
 	err := i.db.Where("connected = ? AND client_name = ?", true, clientName).Find(&instances).Error
+	if err != nil {
+		return nil, err
+	}
+
+	return instances, nil
+}
+
+// GetAllReconnectableInstances retorna instâncias pareadas (jid preenchido) que
+// não foram deslogadas explicitamente pelo WhatsApp — usada por ConnectOnStartup
+// para reconectar sozinho após um restart do processo, em vez de depender de
+// `connected = true`, que é zerado em toda desconexão (inclusive as
+// transitórias que o próprio serviço reconecta sozinho em runtime).
+// Instâncias com "logged out" no disconnect_reason precisam de um novo QR
+// code e ficam de fora de propósito.
+func (i *instanceRepository) GetAllReconnectableInstances() ([]*instance_model.Instance, error) {
+	var instances []*instance_model.Instance
+	err := i.db.Where("jid <> ? AND (disconnect_reason IS NULL OR disconnect_reason NOT LIKE ?)", "", "%logged out%").Find(&instances).Error
+	if err != nil {
+		return nil, err
+	}
+
+	return instances, nil
+}
+
+func (i *instanceRepository) GetAllReconnectableInstancesByClientName(clientName string) ([]*instance_model.Instance, error) {
+	var instances []*instance_model.Instance
+	err := i.db.Where("jid <> ? AND (disconnect_reason IS NULL OR disconnect_reason NOT LIKE ?) AND client_name = ?", "", "%logged out%", clientName).Find(&instances).Error
 	if err != nil {
 		return nil, err
 	}

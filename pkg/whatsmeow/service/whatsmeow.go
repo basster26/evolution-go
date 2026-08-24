@@ -2473,13 +2473,13 @@ func (w whatsmeowService) ConnectOnStartup(clientName string) {
 	var err error
 
 	if clientName != "" {
-		instances, err = w.instanceRepository.GetAllConnectedInstancesByClientName(clientName)
+		instances, err = w.instanceRepository.GetAllReconnectableInstancesByClientName(clientName)
 		if err != nil {
 			w.loggerWrapper.GetLogger(clientName).LogError("[%s] Error getting all connected instances: %s", clientName, err)
 			return
 		}
 	} else {
-		instances, err = w.instanceRepository.GetAllConnectedInstances()
+		instances, err = w.instanceRepository.GetAllReconnectableInstances()
 		if err != nil {
 			w.loggerWrapper.GetLogger(clientName).LogError("[%s] Error getting all connected instances: %s", clientName, err)
 			return
