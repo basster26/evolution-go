@@ -211,6 +211,21 @@ func (w whatsmeowService) ReconnectClient(instanceId string) error {
 	delete(w.myClientPointer, instanceId)
 	delete(w.killChannel, instanceId)
 
+	// O kill signal acima é best-effort (non-blocking select contra um select
+	// igualmente non-blocking dentro do loop de StartClient, que passa ~999ms
+	// de cada 1s dormindo em vez de escutando o canal) — na prática ele quase
+	// nunca é entregue, e a goroutine antiga de StartClient fica presa para
+	// sempre no loop, sem nunca soltar o lock de instanceStartLocks (held via
+	// defer desde o início de StartClient). Sem isto, todo StartInstance/
+	// StartClient subsequente para esta instância trava para sempre em
+	// mu.Lock() — sintoma observado em produção: qualquer desconexão do
+	// WhatsApp (queda de rede, celular offline) mata a instância definitivamente
+	// até um restart manual do container. Descartar o mutex força a próxima
+	// tentativa a usar um lock novo em vez de esperar por um que nunca será
+	// liberado; a goroutine antiga fica órfã (inofensiva, apenas dormindo) até
+	// o processo reiniciar.
+	instanceStartLocks.Delete(instanceId)
+
 	// Limpar cache de userInfo para esta instância
 	if instance, err := w.instanceRepository.GetInstanceByID(instanceId); err == nil {
 		w.userInfoCache.Delete(instance.Token)
@@ -650,7 +665,11 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 
 			// restart client
 			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Restarting client", cd.Instance.Id)
-			w.StartClient(cd)
+			// go: chamar StartClient direto aqui autodeadlockaria — este frame
+			// ainda segura o mutex de instanceStartLocks (defer mu.Unlock() só
+			// roda no `return` logo abaixo), e StartClient tenta re-adquirir o
+			// mesmo mutex (não reentrante) para esta instância.
+			go w.StartClient(cd)
 			return
 		default:
 			time.Sleep(1000 * time.Millisecond)
