@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image/png"
 	"io"
@@ -20,6 +21,7 @@ import (
 
 	"golang.org/x/image/webp"
 	"google.golang.org/protobuf/proto"
+	"gorm.io/gorm"
 
 	_ "github.com/lib/pq"
 	"github.com/patrickmn/go-cache"
@@ -235,6 +237,7 @@ func (w whatsmeowService) ReconnectClient(instanceId string) error {
 	// Passo 3: Atualizar status no banco
 	instance, err := w.instanceRepository.GetInstanceByID(instanceId)
 	if err != nil {
+		w.scheduleReconnect(instanceId)
 		return fmt.Errorf("failed to get instance: %v", err)
 	}
 
@@ -250,7 +253,11 @@ func (w whatsmeowService) ReconnectClient(instanceId string) error {
 
 	// Passo 5: Iniciar nova instância como se fosse a primeira vez
 	w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Starting fresh instance", instanceId)
-	return w.StartInstance(instanceId)
+	if err := w.StartInstance(instanceId); err != nil {
+		w.scheduleReconnect(instanceId)
+		return err
+	}
+	return nil
 }
 
 func (w whatsmeowService) ForceUpdateJid(instanceId string, number string) error {
@@ -333,6 +340,96 @@ func lockInstanceStart(instanceId string) *sync.Mutex {
 	return l.(*sync.Mutex)
 }
 
+// Retry de reconexão de instâncias pareadas. Antes, uma falha de Connect() logo
+// após um Disconnected deixava a instância morta até restart do container.
+var (
+	reconnectPending  sync.Map // instanceId -> struct{}: no máximo um retry agendado por instância
+	reconnectAttempts sync.Map // instanceId -> int: falhas seguidas, para o backoff
+)
+
+// reconnectBackoff: 10s, 20s, 40s... até 5min.
+func reconnectBackoff(attempt int) time.Duration {
+	if attempt > 5 {
+		return 5 * time.Minute
+	}
+	return min(10*time.Second<<attempt, 5*time.Minute)
+}
+
+// shouldRetryReconnect: só instância pareada (jid no banco e device store com ID).
+// Sem device store ela precisa de QR; tentar de novo só gera loop de QR.
+func shouldRetryReconnect(jid string, client *whatsmeow.Client) bool {
+	return jid != "" && (client == nil || client.Store == nil || client.Store.ID != nil)
+}
+
+func cancelReconnect(instanceId string) {
+	reconnectPending.Delete(instanceId)
+	reconnectAttempts.Delete(instanceId)
+}
+
+func (w whatsmeowService) scheduleReconnect(instanceId string) {
+	if _, pending := reconnectPending.LoadOrStore(instanceId, struct{}{}); pending {
+		return
+	}
+	attempt := 0
+	if v, ok := reconnectAttempts.Load(instanceId); ok {
+		attempt = v.(int)
+	}
+	reconnectAttempts.Store(instanceId, attempt+1)
+	delay := reconnectBackoff(attempt)
+	w.loggerWrapper.GetLogger(instanceId).LogWarn("[%s] Reconnect retry in %s (attempt %d)", instanceId, delay, attempt+1)
+
+	go func() {
+		time.Sleep(delay)
+		if _, still := reconnectPending.LoadAndDelete(instanceId); !still {
+			return // cancelado por Connected/LoggedOut
+		}
+		if c := w.clientPointer[instanceId]; c != nil && c.IsConnected() {
+			cancelReconnect(instanceId)
+			return
+		}
+		inst, err := w.instanceRepository.GetInstanceByID(instanceId)
+		if errors.Is(err, gorm.ErrRecordNotFound) || (err == nil && inst.Jid == "") {
+			cancelReconnect(instanceId) // apagada ou deslogada: precisa de QR, não de retry
+			return
+		}
+		if err == nil {
+			err = w.StartInstance(instanceId)
+		}
+		// Falha do StartClient disparado acima reagenda via startClientFailed.
+		if err != nil {
+			w.loggerWrapper.GetLogger(instanceId).LogError("[%s] Reconnect retry failed: %v", instanceId, err)
+			w.scheduleReconnect(instanceId)
+		}
+	}()
+}
+
+// startClientFailed tira o cliente que não conectou dos maps, para /instance/connect
+// e GetQr enxergarem "sem cliente" e religarem, grava o motivo e agenda retry.
+func (w whatsmeowService) startClientFailed(cd *ClientData, client *whatsmeow.Client, err error) {
+	id := cd.Instance.Id
+	// Só remove se ainda for o nosso: ReconnectClient descarta o lock e outro StartClient pode ter assumido.
+	if client != nil && w.clientPointer[id] == client {
+		if mycli := w.myClientPointer[id]; mycli != nil && mycli.WAClient == client {
+			client.RemoveEventHandler(mycli.eventHandlerID)
+			delete(w.myClientPointer, id)
+		}
+		client.Disconnect()
+		delete(w.clientPointer, id)
+	}
+
+	reason := "Connect failed"
+	if err != nil {
+		reason += ": " + err.Error()
+	}
+	if updErr := w.instanceRepository.UpdateConnected(id, false, reason); updErr != nil {
+		w.loggerWrapper.GetLogger(id).LogError("[%s] Error updating instance: %v", id, updErr)
+	}
+
+	if shouldRetryReconnect(cd.Instance.Jid, client) {
+		w.scheduleReconnect(id)
+	}
+}
+
 func (w whatsmeowService) StartClient(cd *ClientData) {
 
 	w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("Starting websocket connection to Whatsapp for user '%s'", cd.Instance.Id)
@@ -342,7 +439,12 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 	// não só a checagem abaixo: é exatamente essa janela que a race explora.
 	mu := lockInstanceStart(cd.Instance.Id)
 	mu.Lock()
-	defer mu.Unlock()
+	locked := true
+	defer func() {
+		if locked {
+			mu.Unlock()
+		}
+	}()
 
 	var deviceStore *store.Device
 	var err error
@@ -352,6 +454,16 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 			return
 		}
 	}
+
+	// Todo `return` daqui até o Connect dar certo é falha: limpa o cliente morto
+	// e agenda retry. Registrado depois do defer do unlock, roda ainda sob o lock.
+	var client *whatsmeow.Client
+	connected := false
+	defer func() {
+		if !connected {
+			w.startClientFailed(cd, client, err)
+		}
+	}()
 
 	var container *sqlstore.Container
 
@@ -462,7 +574,7 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 		minLevel = "INFO" // Nível mínimo para garantir que logs INFO apareçam
 	}
 	clientLog := waLog.Stdout("Client", minLevel, true)
-	client := whatsmeow.NewClient(deviceStore, clientLog)
+	client = whatsmeow.NewClient(deviceStore, clientLog)
 
 	w.clientPointer[cd.Instance.Id] = client
 
@@ -623,6 +735,13 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 	}
 
 	// Removed auto-reconnect logic to prevent infinite loops
+
+	// Conectou: solta o lock antes do loop abaixo, que só sai no kill. Segurá-lo
+	// aqui travava para sempre qualquer StartInstance seguinte desta instância.
+	// Um StartClient concorrente pega o lock e sai em IsConnected() acima.
+	connected = true
+	locked = false
+	mu.Unlock()
 
 	for {
 		select {
@@ -931,6 +1050,9 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			}
 		}
 	case *events.Connected, *events.PushNameSetting:
+		if _, ok := rawEvt.(*events.Connected); ok {
+			cancelReconnect(mycli.userID)
+		}
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] events.Connected to Whatsapp for user '%s'", mycli.userID, mycli.WAClient.Store.PushName)
 		if len(mycli.WAClient.Store.PushName) > 0 {
 			doWebhook = true
@@ -1889,6 +2011,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 	case *events.AppState:
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] App state event received %+v", mycli.userID, evt)
 	case *events.LoggedOut:
+		cancelReconnect(mycli.userID)
 		doWebhook = true
 		postMap["event"] = "LoggedOut"
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Logged out for reason %s", mycli.userID, evt.Reason.String())
