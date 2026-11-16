@@ -477,6 +477,7 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 		dbLog := waLog.Stdout("Database", w.config.WaDebug, true)
 		if w.config.PostgresAuthDB != "" {
 			container = sqlstore.NewWithDB(w.authDB, "postgres", dbLog)
+			err = container.Upgrade(context.Background())
 		} else {
 			dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
 			container, err = sqlstore.New(context.Background(), "sqlite", dsn, dbLog)
@@ -484,6 +485,7 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 	} else {
 		if w.config.PostgresAuthDB != "" {
 			container = sqlstore.NewWithDB(w.authDB, "postgres", nil)
+			err = container.Upgrade(context.Background())
 		} else {
 			dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
 			container, err = sqlstore.New(context.Background(), "sqlite", dsn, nil)
