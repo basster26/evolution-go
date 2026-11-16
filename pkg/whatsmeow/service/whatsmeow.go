@@ -743,9 +743,15 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 	locked = false
 	mu.Unlock()
 
+	// Canal lido uma vez: um loop substituído (ReconnectClient apaga o canal e
+	// outro StartClient assume) não pode consumir o kill do cliente novo.
+	kill := w.killChannel[cd.Instance.Id]
 	for {
+		if w.clientPointer[cd.Instance.Id] != client {
+			return // cliente substituído ou removido: este loop acabou
+		}
 		select {
-		case <-w.killChannel[cd.Instance.Id]:
+		case <-kill:
 			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("Received kill signal for user '%s'", cd.Instance.Id)
 			client.Disconnect()
 
