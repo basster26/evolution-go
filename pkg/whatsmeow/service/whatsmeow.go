@@ -131,6 +131,7 @@ type MyClient struct {
 	natsProducer       producer_interfaces.Producer
 	loggerWrapper      *logger_wrapper.LoggerManager
 	qrcodeCount        int
+	qrExpired          bool // QR expirou sem pareamento: o kill não deve reiniciar o cliente
 	passkeyCeremony    *ceremony.Store
 }
 
@@ -231,7 +232,7 @@ func (w whatsmeowService) ReconnectClient(instanceId string) error {
 	// Limpar cache de userInfo para esta instância
 	if instance, err := w.instanceRepository.GetInstanceByID(instanceId); err == nil {
 		w.userInfoCache.Delete(instance.Token)
-		w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] UserInfo cache cleared for token: %s", instanceId, instance.Token)
+		w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] UserInfo cache cleared", instanceId)
 	}
 
 	// Passo 3: Atualizar status no banco
@@ -762,7 +763,7 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 
 			// Limpar cache de userInfo para esta instância
 			w.userInfoCache.Delete(cd.Instance.Token)
-			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] UserInfo cache cleared for token: %s", cd.Instance.Id, cd.Instance.Token)
+			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] UserInfo cache cleared", cd.Instance.Id)
 
 			cd.Instance.Connected = false
 
@@ -801,6 +802,14 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 
 			if mycli.config.AmqpGlobalEnabled || mycli.config.NatsGlobalEnabled {
 				go mycli.service.SendToGlobalQueues(postMap["event"].(string), values, mycli.userID)
+			}
+
+			// QR expirado sem pareamento: reiniciar geraria outro QR e assim por
+			// diante para sempre (e zeraria o qrcodeCount, anulando QRCODE_MAX_COUNT).
+			// A instância fica parada até um novo /instance/connect.
+			if mycli.qrExpired {
+				w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] QR expired without pairing — client stopped until next connect", cd.Instance.Id)
+				return
 			}
 
 			// restart client
@@ -1031,6 +1040,7 @@ func (mycli *MyClient) teardownQR(reason string, forceLogout bool) {
 	// maps (it is the single writer for this instance). Blocking send mirrors
 	// the original timeout branch so the signal is never dropped.
 	mycli.loggerWrapper.GetLogger(instanceID).LogWarn("[%s] QR timeout — signaling kill channel", instanceID)
+	mycli.qrExpired = true // antes do envio: o canal garante que o loop do kill enxerga o valor
 	if killChan, exists := mycli.killChannel[instanceID]; exists {
 		killChan <- true
 	}
@@ -2026,7 +2036,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 
 		// Limpar cache de userInfo para esta instância
 		mycli.userInfoCache.Delete(mycli.Instance.Token)
-		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] UserInfo cache cleared for token: %s", mycli.userID, mycli.Instance.Token)
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] UserInfo cache cleared", mycli.userID)
 
 		mycli.Instance.DisconnectReason = evt.Reason.String()
 		mycli.Instance.Connected = false
@@ -2145,7 +2155,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 
 		// Limpar cache de userInfo para esta instância
 		mycli.userInfoCache.Delete(mycli.Instance.Token)
-		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] UserInfo cache cleared for token: %s", mycli.userID, mycli.Instance.Token)
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] UserInfo cache cleared", mycli.userID)
 
 		mycli.Instance.DisconnectReason = evt.Reason.String()
 		mycli.Instance.Connected = false
@@ -2159,7 +2169,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 
 		// Limpar cache de userInfo para esta instância (mas não para reconexão automática)
 		mycli.userInfoCache.Delete(mycli.Instance.Token)
-		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] UserInfo cache cleared for token: %s", mycli.userID, mycli.Instance.Token)
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] UserInfo cache cleared", mycli.userID)
 
 		mycli.Instance.DisconnectReason = "Disconnected emitted because the websocket is closed by the server."
 		mycli.Instance.Connected = false
