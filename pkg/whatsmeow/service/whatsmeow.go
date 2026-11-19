@@ -131,7 +131,7 @@ type MyClient struct {
 	natsProducer       producer_interfaces.Producer
 	loggerWrapper      *logger_wrapper.LoggerManager
 	qrcodeCount        int
-	qrExpired          bool // QR expirou sem pareamento: o kill não deve reiniciar o cliente
+	qrExpired          bool // QR expirou sem pareamento (setado em teardownQR)
 	passkeyCeremony    *ceremony.Store
 }
 
@@ -152,6 +152,7 @@ type ClientData struct {
 	Subscriptions []string
 	Phone         string
 	IsProxy       bool
+	qrcodeCount   int // QRs já gerados nos reinícios por timeout; um connect novo começa do zero
 }
 
 type Values struct {
@@ -660,7 +661,7 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 		processedMessages:  w.processedMessages,
 		natsProducer:       w.natsProducer,
 		loggerWrapper:      w.loggerWrapper,
-		qrcodeCount:        0,
+		qrcodeCount:        cd.qrcodeCount,
 		passkeyCeremony:    w.passkeyCeremony,
 	}
 
@@ -804,12 +805,17 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 				go mycli.service.SendToGlobalQueues(postMap["event"].(string), values, mycli.userID)
 			}
 
-			// QR expirado sem pareamento: reiniciar geraria outro QR e assim por
-			// diante para sempre (e zeraria o qrcodeCount, anulando QRCODE_MAX_COUNT).
-			// A instância fica parada até um novo /instance/connect.
+			// QR expirado sem pareamento: o reinício continua a rotação, mas leva a
+			// contagem adiante; sem isso cada reinício zerava qrcodeCount e
+			// QRCODE_MAX_COUNT nunca era atingido (loop de QR sem fim). Atingido o
+			// máximo, a instância fica parada até um novo /instance/connect.
+			cd.qrcodeCount = 0
 			if mycli.qrExpired {
-				w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] QR expired without pairing — client stopped until next connect", cd.Instance.Id)
-				return
+				if mycli.config.QrcodeMaxCount > 0 && mycli.qrcodeCount >= mycli.config.QrcodeMaxCount {
+					w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] QR max count reached without pairing — client stopped until next connect", cd.Instance.Id)
+					return
+				}
+				cd.qrcodeCount = mycli.qrcodeCount
 			}
 
 			// restart client
