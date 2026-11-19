@@ -80,6 +80,11 @@ type MessageStatusStruct struct {
 type MessageStruct struct {
 	Chat      string `json:"chat"`
 	MessageID string `json:"messageId"`
+	// Participant is the JID of whoever SENT the message being revoked.
+	// Required to revoke someone else's message in a group (the instance
+	// must be an admin there). Empty keeps the legacy behavior of revoking
+	// the instance's own message.
+	Participant string `json:"participant,omitempty"`
 }
 
 type EditMessageStruct struct {
@@ -478,12 +483,25 @@ func (m *messageService) DeleteMessageEveryone(data *MessageStruct, instance *in
 		return "", "", errors.New("invalid phone number")
 	}
 
+	// An empty sender tells whatsmeow to build a self-revoke (FromMe: true).
+	// Passing the real author instead makes it an admin revoke, which is the
+	// only way to delete another member's message.
+	sender := types.EmptyJID
+	if data.Participant != "" {
+		parsedSender, senderOk := utils.ParseJID(data.Participant)
+		if !senderOk {
+			m.loggerWrapper.GetLogger(instance.Id).LogError("[%s] Error validating participant JID: %s", instance.Id, data.Participant)
+			return "", "", errors.New("invalid participant")
+		}
+		sender = parsedSender
+	}
+
 	m.loggerWrapper.GetLogger(instance.Id).LogInfo("Revoking message %s from %s", data.MessageID, recipient)
 
 	resp, err := client.SendMessage(
 		context.Background(),
 		recipient,
-		client.BuildRevoke(recipient, types.EmptyJID, data.MessageID))
+		client.BuildRevoke(recipient, sender, data.MessageID))
 	if err != nil {
 		m.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error revoking message: %v", instance.Id, err)
 		return "", "", err

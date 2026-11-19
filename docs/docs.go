@@ -4435,6 +4435,10 @@ const docTemplate = `{
                 },
                 "messageId": {
                     "type": "string"
+                },
+                "participant": {
+                    "description": "JID of whoever sent the message being revoked. Required to revoke another member's message in a group (the instance must be an admin). Empty revokes the instance's own message.",
+                    "type": "string"
                 }
             }
         },
